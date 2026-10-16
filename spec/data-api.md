@@ -386,7 +386,7 @@ Answered by Q920 (owner, 2026-10-16): automatic per-session branches.
 - From then on, every request of that session against the same base target, reads included, runs on the agent branch, so the agent reads its own writes. `effective_target` names that branch.
 - The caller MAY instead name a non-protected branch as its target, and writes then go there.
 - An agent write MUST NOT reach a protected branch, whatever target is named.
-- Agent branches expire **7 days** after their last write (this draft reads "TTL 7 days" as an idle TTL; see Appendix B). Expiry deletes the branch.
+- Agent branches expire **7 days** after their last write (an idle TTL, confirmed by the owner on 2026-10-16; see Appendix B). Expiry deletes the branch.
 - Changes reach the real branch only through a human-approved merge, or through `ReplayCalls` (§10.4) run by a non-agent credential.
 - `engine:` targets have no branches. Agents are read-only there in v1.
 
@@ -448,13 +448,13 @@ The conformance suite (`conformance/`) is public, and passing it is how an imple
 
 | Point | Choice | Revisit |
 |---|---|---|
-| Name of the dry-run RPC | `Explain` (design 58 D1043/D1045); "dry run" names the concept | Rename to `DryRun` only if reviewers prefer it |
+| Name of the dry-run RPC | `Explain` (design 58 D1043/D1045); "dry run" names the concept | **Confirmed by the owner, 2026-10-16** |
 | Registration surface | A separate `OperationService`, so it can be authorised as administration | — |
 | `ExecuteArrow` shape | Server-streaming chunks, not one unary message of up to 256 MiB | — |
 | JSON row shape | `ListValue` arrays, with 64-bit ints and decimals as strings | — |
 | Budget inside interactive transactions | Per `Continue` call; the lifetime is capped separately | new question |
-| Agent branch TTL | 7 days since the last write, not since creation | Q920 follow-up |
-| Agent reads after the first write | Redirected to the agent branch (read your own writes) | — |
+| Agent branch TTL | 7 days since the last write, not since creation | **Confirmed by the owner, 2026-10-16** |
+| Agent reads after the first write | Redirected to the agent branch (read your own writes); raw SQL writes are refused even there | **Confirmed by the owner, 2026-10-16** |
 | Replay of results over 1 MiB | Counts only, flagged as truncated | — |
 | Keys for diffs without a primary key | Multiset by full row; no `changed` | Q919 |
 | Cost units across target kinds | Not comparable | — |
