@@ -1,0 +1,841 @@
+// Copyright 2026 The Loams Authors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+// The Loams Data API, `data-api-1` (draft v0). The normative text is
+// `spec/data-api.md`; section numbers in these comments (`§n`) refer to it.
+// Where this file and the spec disagree, the spec wins and this file is a bug.
+//
+// Rules for the whole package:
+//
+// - Every RPC is unary except `Subscribe` and `ExecuteArrow`, which are
+//   server-streaming. There is no client or bidirectional streaming (§3).
+// - Errors are Connect/gRPC errors carrying exactly one `ErrorDetail` (§6).
+// - SQL values travel as `google.protobuf.Value` with the encoding of §9.1,
+//   so the JSON form of a row is a plain JSON array.
+package loams.data.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// DataService runs SQL against a target (§4).
+service DataService {
+  // Execute runs a statement batch (§4.1). By default the batch is one
+  // transaction: all statements commit or none do.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // ExecuteArrow runs a statement batch and returns its result sets as Arrow
+  // IPC streams, or as presigned partition URLs (§9.2, §9.3).
+  rpc ExecuteArrow(ExecuteArrowRequest) returns (stream ExecuteArrowResponse);
+
+  // Call invokes a registered named operation (§10).
+  rpc Call(CallRequest) returns (CallResponse);
+
+  // Begin opens an interactive transaction and returns its first baton (§4.3).
+  rpc Begin(BeginRequest) returns (BeginResponse);
+
+  // Continue runs statements inside an interactive transaction.
+  rpc Continue(ContinueRequest) returns (ContinueResponse);
+
+  // Commit commits an interactive transaction.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Rollback rolls back an interactive transaction. It is idempotent: an
+  // expired or unknown baton is not an error.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse) {
+    option idempotency_level = IDEMPOTENT;
+  }
+
+  // Explain is the dry run (§7): plan, estimates and write set, executing
+  // nothing.
+  rpc Explain(ExplainRequest) returns (ExplainResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Subscribe is a live query (§11): an initial snapshot, then keyed diffs.
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// OperationService registers named operations (§10.1). It is an
+// administrative surface and is authorised separately from DataService.
+service OperationService {
+  // RegisterOperation registers (or re-registers) a SQL function as a named
+  // operation.
+  rpc RegisterOperation(RegisterOperationRequest) returns (RegisterOperationResponse);
+
+  // GetOperation describes one named operation.
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // ListOperations lists a target's named operations.
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // UnregisterOperation removes a named operation. The SQL function is left
+  // in place.
+  rpc UnregisterOperation(UnregisterOperationRequest) returns (UnregisterOperationResponse) {
+    option idempotency_level = IDEMPOTENT;
+  }
+
+  // ReplayCalls re-runs logged calls on a branch (§10.4).
+  rpc ReplayCalls(ReplayCallsRequest) returns (ReplayCallsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Common request context (§5)
+// ---------------------------------------------------------------------------
+
+// RequestContext is carried by every request that names a target.
+message RequestContext {
+  // The target (§5.1): `postgres:<project>/<branch>/<database>`,
+  // `sql:<database>/<branch>` or `engine:<namespace>`.
+  string target = 1;
+  // Resource caps (§8). Unset fields take the credential's defaults; a
+  // request can only lower a cap, never raise it above the credential's.
+  Budget budget = 2;
+  // The read consistency (§5.3). Unset means STRONG.
+  Consistency consistency = 3;
+  // An advice-set name for plan control (design 58 §4). Empty means none.
+  string plan_advice = 4;
+  // Request attributes (design 58 D1038), e.g. `app.tenant`. Keys MUST match
+  // `[a-z][a-z0-9_.]{0,63}`. `traceparent` and `tracestate` are not allowed
+  // here; they travel as headers (§5.4).
+  map<string, string> attributes = 5;
+}
+
+// Budget caps one call (§8).
+message Budget {
+  // Wall-clock cap on execution. Zero means the credential's default.
+  google.protobuf.Duration max_duration = 1;
+  // Cap on rows returned plus rows written.
+  uint64 max_rows = 2;
+  // Cap on result bytes, measured in the response encoding.
+  uint64 max_bytes = 3;
+  // Cap on the planner's cost estimate (§8.2).
+  double max_cost_units = 4;
+}
+
+// Consistency selects how fresh a read must be (§5.3).
+message Consistency {
+  // The consistency mode.
+  ConsistencyMode mode = 1;
+  // For CONSISTENCY_MODE_AT_LEAST: a token from an earlier response's
+  // `ResponseMeta.consistency_token`.
+  string at_least_token = 2;
+}
+
+// ConsistencyMode is the read mode.
+enum ConsistencyMode {
+  // Treated as CONSISTENCY_MODE_STRONG.
+  CONSISTENCY_MODE_UNSPECIFIED = 0;
+  // Read the primary's latest committed state.
+  CONSISTENCY_MODE_STRONG = 1;
+  // Read any replica at or after the given token.
+  CONSISTENCY_MODE_AT_LEAST = 2;
+  // Any replica, with bounded but unreported staleness.
+  CONSISTENCY_MODE_REPLICA_OK = 3;
+}
+
+// ResponseMeta is returned by every successful response.
+message ResponseMeta {
+  // The server's id for this request, used in logs and result paths.
+  string request_id = 1;
+  // The target the request actually ran against. It differs from the
+  // requested target when the agent profile redirected writes (§12.3).
+  string effective_target = 2;
+  // A token for CONSISTENCY_MODE_AT_LEAST reads that must observe this
+  // request's effects. Opaque to clients.
+  string consistency_token = 3;
+  // True when this response is a stored result returned for a retried
+  // idempotency key (§6.1).
+  bool idempotent_replay = 4;
+  // What the call consumed against its budget.
+  Usage usage = 5;
+  // The spec version the server implements, e.g. `data-api-1.0`.
+  string api_version = 6;
+  // With `idempotent_replay`: the stored result was too large to keep, so
+  // only counts and command tags are returned (§6.1).
+  bool replay_truncated = 7;
+}
+
+// Usage is what a call consumed.
+message Usage {
+  // Server-side execution time.
+  google.protobuf.Duration duration = 1;
+  // Rows returned.
+  uint64 rows_returned = 2;
+  // Rows written (inserted, updated or deleted).
+  uint64 rows_written = 3;
+  // Result bytes in the response encoding.
+  uint64 bytes_returned = 4;
+  // The planner's cost estimate summed over the statements.
+  double cost_units = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Statements and results (§4.1, §9)
+// ---------------------------------------------------------------------------
+
+// Statement is one SQL statement with its parameters.
+message Statement {
+  // The SQL text, in the target's dialect. One statement only.
+  string sql = 1;
+  // Positional parameters ($1, $2, ... or ?), in order.
+  repeated Param positional = 2;
+  // Named parameters (:name). A statement uses positional or named, not both.
+  map<string, Param> named = 3;
+}
+
+// Param is a parameter value with an optional type.
+message Param {
+  // The value, encoded as in §9.1.
+  google.protobuf.Value value = 1;
+  // The target type name (e.g. `int8`, `numeric`, `jsonb`). Empty lets the
+  // server infer it.
+  string type = 2;
+}
+
+// Column describes one column of a result set (§9.1).
+message Column {
+  // The column's name (its label in the select list).
+  string name = 1;
+  // The target's type name, e.g. `int8`, `timestamptz`, `varchar(32)`.
+  string type = 2;
+  // The Postgres type OID, or 0 for other targets.
+  uint32 type_oid = 3;
+  // Whether the column may hold NULL.
+  bool nullable = 4;
+  // The origin table, schema-qualified, when the column comes directly from
+  // one. Empty otherwise.
+  string origin_table = 5;
+  // The origin column's name, when `origin_table` is set.
+  string origin_column = 6;
+  // Whether the column is part of the origin table's primary key.
+  bool is_key = 7;
+}
+
+// ResultSet is a statement's rows in the JSON encoding.
+message ResultSet {
+  // The columns, in order.
+  repeated Column columns = 1;
+  // The rows; each is a JSON array with one value per column (§9.1).
+  repeated google.protobuf.ListValue rows = 2;
+  // Rows affected, for INSERT, UPDATE, DELETE and MERGE.
+  uint64 rows_affected = 3;
+  // The command tag, e.g. `INSERT 0 3` or `SELECT 2`.
+  string command_tag = 4;
+}
+
+// StatementResult is one statement's outcome within a batch.
+message StatementResult {
+  // The result set; empty columns and rows for statements without rows.
+  ResultSet result = 1;
+  // Set only in AUTOCOMMIT_EACH mode, for the statement that failed (§4.1).
+  ErrorDetail error = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Execute (§4.1)
+// ---------------------------------------------------------------------------
+
+// ExecuteRequest is a statement batch.
+message ExecuteRequest {
+  // The target, budget and consistency.
+  RequestContext context = 1;
+  // The statements, run in order. At least one; at most 256.
+  repeated Statement statements = 2;
+  // How the batch maps to transactions.
+  BatchMode mode = 3;
+  // 16-64 bytes; see §6.1. Empty means none.
+  bytes idempotency_key = 4;
+  // Run the batch READ ONLY. Writes fail with `read_only_violation`.
+  bool read_only = 5;
+}
+
+// BatchMode maps a batch to transactions.
+enum BatchMode {
+  // Treated as BATCH_MODE_TRANSACTION.
+  BATCH_MODE_UNSPECIFIED = 0;
+  // One transaction for the whole batch: all or nothing.
+  BATCH_MODE_TRANSACTION = 1;
+  // Each statement commits on its own; the batch stops at the first error.
+  BATCH_MODE_AUTOCOMMIT_EACH = 2;
+}
+
+// ExecuteResponse is a batch's results.
+message ExecuteResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // One result per statement that ran, in order. In AUTOCOMMIT_EACH mode the
+  // list ends at the failed statement, whose `error` is set.
+  repeated StatementResult results = 2;
+}
+
+// ---------------------------------------------------------------------------
+// ExecuteArrow (§9.2, §9.3)
+// ---------------------------------------------------------------------------
+
+// ExecuteArrowRequest is a statement batch with an Arrow result.
+message ExecuteArrowRequest {
+  // The batch, as for Execute.
+  ExecuteRequest execute = 1;
+  // How results are delivered.
+  Delivery delivery = 2;
+  // The partition file format, when partitions are used.
+  PartitionFormat partition_format = 3;
+}
+
+// Delivery chooses inline Arrow or presigned partitions.
+enum Delivery {
+  // Treated as DELIVERY_AUTO.
+  DELIVERY_UNSPECIFIED = 0;
+  // Inline up to the inline threshold, partitions beyond it.
+  DELIVERY_AUTO = 1;
+  // Inline only; a larger result fails with `result_too_large`.
+  DELIVERY_INLINE = 2;
+  // Always partitions.
+  DELIVERY_PARTITIONS = 3;
+}
+
+// PartitionFormat is a partition file's format.
+enum PartitionFormat {
+  // Treated as PARTITION_FORMAT_PARQUET.
+  PARTITION_FORMAT_UNSPECIFIED = 0;
+  // Apache Parquet.
+  PARTITION_FORMAT_PARQUET = 1;
+  // An Arrow IPC stream file.
+  PARTITION_FORMAT_ARROW_IPC = 2;
+}
+
+// ExecuteArrowResponse is one message of the result stream. The stream is:
+// for each result set, one `header`, then `ipc` chunks or one `partitions`;
+// then one `trailer`.
+message ExecuteArrowResponse {
+  // The message.
+  oneof message {
+    // Starts a result set.
+    ArrowHeader header = 1;
+    // A chunk of the current result set's Arrow IPC stream. Concatenating
+    // the chunks of one result set yields one complete IPC stream.
+    bytes ipc = 2;
+    // The current result set, delivered as partitions.
+    Partitions partitions = 3;
+    // Ends the response.
+    ArrowTrailer trailer = 4;
+  }
+}
+
+// ArrowHeader starts one result set.
+message ArrowHeader {
+  // The statement's index in the batch.
+  uint32 statement_index = 1;
+  // The columns, with the same metadata as JSON results.
+  repeated Column columns = 2;
+  // Rows affected, for writes.
+  uint64 rows_affected = 3;
+  // The command tag.
+  string command_tag = 4;
+}
+
+// Partitions is a manifest of presigned result objects (§9.3).
+message Partitions {
+  // The partitions, in result order.
+  repeated Partition parts = 1;
+  // When every URL stops working.
+  google.protobuf.Timestamp expires_at = 2;
+  // The format of every part.
+  PartitionFormat format = 3;
+}
+
+// Partition is one result object.
+message Partition {
+  // A presigned GET URL, or a download-endpoint URL where the store cannot
+  // presign.
+  string url = 1;
+  // Rows in this part.
+  uint64 rows = 2;
+  // The object's size.
+  uint64 bytes = 3;
+}
+
+// ArrowTrailer ends an ExecuteArrow response.
+message ArrowTrailer {
+  // Request metadata.
+  ResponseMeta meta = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Interactive transactions (§4.3)
+// ---------------------------------------------------------------------------
+
+// BeginRequest opens an interactive transaction.
+message BeginRequest {
+  // The target, budget and consistency. The budget applies to each later
+  // Continue call separately.
+  RequestContext context = 1;
+  // The isolation level.
+  IsolationLevel isolation = 2;
+  // Open the transaction READ ONLY.
+  bool read_only = 3;
+  // Idle time after which the transaction is rolled back. Zero means 10 s;
+  // the maximum is 60 s.
+  google.protobuf.Duration idle_timeout = 4;
+}
+
+// IsolationLevel is a transaction isolation level.
+enum IsolationLevel {
+  // The target's default.
+  ISOLATION_LEVEL_UNSPECIFIED = 0;
+  // READ COMMITTED.
+  ISOLATION_LEVEL_READ_COMMITTED = 1;
+  // REPEATABLE READ (snapshot isolation on Loams SQL).
+  ISOLATION_LEVEL_REPEATABLE_READ = 2;
+  // SERIALIZABLE.
+  ISOLATION_LEVEL_SERIALIZABLE = 3;
+}
+
+// BeginResponse carries the first baton.
+message BeginResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // The baton for the next call. Opaque; single use.
+  string baton = 2;
+  // When the transaction is rolled back if no call arrives.
+  google.protobuf.Timestamp idle_deadline = 3;
+}
+
+// ContinueRequest runs statements in a transaction.
+message ContinueRequest {
+  // The baton from the previous response.
+  string baton = 1;
+  // The statements, run in order.
+  repeated Statement statements = 2;
+}
+
+// ContinueResponse carries results and the next baton.
+message ContinueResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // One result per statement.
+  repeated StatementResult results = 2;
+  // The baton for the next call.
+  string baton = 3;
+  // The new idle deadline.
+  google.protobuf.Timestamp idle_deadline = 4;
+}
+
+// CommitRequest commits a transaction.
+message CommitRequest {
+  // The baton from the previous response.
+  string baton = 1;
+  // 16-64 bytes; see §6.1. It is recorded inside the transaction being
+  // committed. Empty means none.
+  bytes idempotency_key = 2;
+}
+
+// CommitResponse confirms a commit.
+message CommitResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+}
+
+// RollbackRequest rolls back a transaction.
+message RollbackRequest {
+  // The baton from the previous response.
+  string baton = 1;
+}
+
+// RollbackResponse confirms a rollback.
+message RollbackResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Explain, the dry run (§7)
+// ---------------------------------------------------------------------------
+
+// ExplainRequest asks for a dry run of a batch or a call.
+message ExplainRequest {
+  // The target, budget and consistency. The budget is checked against the
+  // estimates and reported in `ExplainResponse.over_budget`.
+  RequestContext context = 1;
+  // What to explain.
+  oneof subject {
+    // Statements, as for Execute.
+    StatementList statements = 2;
+    // A named-operation call, as for Call.
+    OperationInvocation call = 3;
+  }
+}
+
+// StatementList wraps a list of statements for use in a oneof.
+message StatementList {
+  // The statements.
+  repeated Statement statements = 1;
+}
+
+// ExplainResponse is a dry run's result.
+message ExplainResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // One plan per statement (a call has one).
+  repeated StatementPlan plans = 2;
+  // The write set of the whole request, merged per table and kind.
+  repeated WriteSetEntry write_set = 3;
+  // The budget fields the estimates exceed, as reasons (`budget_cost`, ...).
+  // Empty means the request fits its budget.
+  repeated string over_budget = 4;
+}
+
+// StatementPlan is one statement's plan and estimates.
+message StatementPlan {
+  // The statement's index.
+  uint32 statement_index = 1;
+  // The statement's kind.
+  StatementKind kind = 2;
+  // The engine's plan, in its native JSON format (e.g. Postgres
+  // `EXPLAIN (FORMAT JSON)`). Empty for utility statements.
+  string plan_json = 3;
+  // Estimated rows returned or written.
+  double estimated_rows = 4;
+  // Estimated cost units (§8.2).
+  double estimated_cost_units = 5;
+  // The engine's query id, when it has one.
+  string query_id = 6;
+  // The plan pins that would apply.
+  repeated string applied_pins = 7;
+  // Set when the statement could not be planned; the others still are.
+  ErrorDetail error = 8;
+}
+
+// StatementKind classifies a statement.
+enum StatementKind {
+  // Unknown.
+  STATEMENT_KIND_UNSPECIFIED = 0;
+  // A read (SELECT, VALUES, read-only WITH).
+  STATEMENT_KIND_READ = 1;
+  // A DML write.
+  STATEMENT_KIND_WRITE = 2;
+  // DDL or another utility statement; not planned, not executed.
+  STATEMENT_KIND_UTILITY = 3;
+}
+
+// WriteSetEntry is one table a request would write.
+message WriteSetEntry {
+  // The table, schema-qualified.
+  string table = 1;
+  // The kind of change.
+  WriteKind kind = 2;
+  // Estimated rows changed; for a named operation, -1 when unknown.
+  double estimated_rows = 3;
+}
+
+// WriteKind is a kind of row change.
+enum WriteKind {
+  // Unknown.
+  WRITE_KIND_UNSPECIFIED = 0;
+  // INSERT.
+  WRITE_KIND_INSERT = 1;
+  // UPDATE.
+  WRITE_KIND_UPDATE = 2;
+  // DELETE.
+  WRITE_KIND_DELETE = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Named operations (§10)
+// ---------------------------------------------------------------------------
+
+// OperationInvocation names an operation and its arguments.
+message OperationInvocation {
+  // The operation's name, schema-qualified (e.g. `api.place_order`).
+  string operation = 1;
+  // The arguments by parameter name. The server-injected parameters
+  // (`_loams_now`, `_loams_seed`) MUST NOT be given.
+  map<string, google.protobuf.Value> args = 2;
+}
+
+// CallRequest invokes a named operation.
+message CallRequest {
+  // The target, budget and consistency.
+  RequestContext context = 1;
+  // The operation and arguments.
+  OperationInvocation call = 2;
+  // 16-64 bytes; see §6.1. Required when the operation's idempotency rule is
+  // IDEMPOTENCY_RULE_REQUIRED.
+  bytes idempotency_key = 3;
+}
+
+// CallResponse is a call's result.
+message CallResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // The function's result.
+  ResultSet result = 2;
+  // The call's id in the call log (§10.4).
+  string call_id = 3;
+  // The clock injected as `_loams_now`.
+  google.protobuf.Timestamp injected_now = 4;
+  // The seed injected as `_loams_seed`.
+  bytes injected_seed = 5;
+  // SHA-256 of the result's canonical encoding (§10.4).
+  bytes result_digest = 6;
+}
+
+// Operation describes a registered named operation.
+message Operation {
+  // The target it is registered on.
+  string target = 1;
+  // Its schema-qualified name.
+  string name = 2;
+  // The caller-visible parameters, in order (injected ones excluded).
+  repeated OperationParam params = 3;
+  // The result columns.
+  repeated Column result_columns = 4;
+  // The declared write set; empty means read-only.
+  repeated WriteSetEntry write_set = 5;
+  // The idempotency rule.
+  IdempotencyRule idempotency = 6;
+  // Roles or credential kinds allowed to call it.
+  repeated string allowed_callers = 7;
+  // The description (from the function's COMMENT unless overridden).
+  string description = 8;
+  // A JSON Schema (2020-12) for the arguments object, for MCP (§12.4).
+  google.protobuf.Struct args_json_schema = 9;
+  // SHA-256 of the function definition at registration; a changed function
+  // must be re-registered.
+  bytes definition_digest = 10;
+  // Whether agent credentials may call it (§12).
+  bool agent_callable = 11;
+}
+
+// OperationParam is one parameter of an operation.
+message OperationParam {
+  // The parameter's name.
+  string name = 1;
+  // The target type name.
+  string type = 2;
+  // Whether the parameter has a default (and so may be omitted).
+  bool has_default = 3;
+}
+
+// IdempotencyRule is an operation's idempotency rule.
+enum IdempotencyRule {
+  // Treated as IDEMPOTENCY_RULE_OPTIONAL.
+  IDEMPOTENCY_RULE_UNSPECIFIED = 0;
+  // A key is accepted but not required.
+  IDEMPOTENCY_RULE_OPTIONAL = 1;
+  // Calls without a key are refused with `idempotency_key_required`.
+  IDEMPOTENCY_RULE_REQUIRED = 2;
+}
+
+// RegisterOperationRequest registers a function as an operation.
+message RegisterOperationRequest {
+  // The target (the branch the function lives on).
+  string target = 1;
+  // The function, schema-qualified.
+  string function = 2;
+  // The tables it may write, and how. Empty declares it read-only.
+  repeated WriteSetEntry write_set = 3;
+  // The idempotency rule.
+  IdempotencyRule idempotency = 4;
+  // Roles or credential kinds allowed to call it.
+  repeated string allowed_callers = 5;
+  // Overrides the function's COMMENT as the description. Empty keeps it.
+  string description = 6;
+  // Whether agent credentials may call it, and so whether MCP exposes it.
+  bool agent_callable = 7;
+}
+
+// RegisterOperationResponse returns the registered operation.
+message RegisterOperationResponse {
+  // The operation as registered.
+  Operation operation = 1;
+}
+
+// GetOperationRequest names an operation.
+message GetOperationRequest {
+  // The target.
+  string target = 1;
+  // The operation's name.
+  string name = 2;
+}
+
+// GetOperationResponse describes an operation.
+message GetOperationResponse {
+  // The operation.
+  Operation operation = 1;
+}
+
+// ListOperationsRequest lists a target's operations (AIP-158 paging).
+message ListOperationsRequest {
+  // The target.
+  string target = 1;
+  // At most this many; 0 takes the server's default.
+  int32 page_size = 2;
+  // From a previous response's `next_page_token`.
+  string page_token = 3;
+}
+
+// ListOperationsResponse is a page of operations.
+message ListOperationsResponse {
+  // The operations.
+  repeated Operation operations = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+
+// UnregisterOperationRequest names an operation to remove.
+message UnregisterOperationRequest {
+  // The target.
+  string target = 1;
+  // The operation's name.
+  string name = 2;
+}
+
+// UnregisterOperationResponse confirms the removal.
+message UnregisterOperationResponse {}
+
+// ReplayCallsRequest replays logged calls onto a branch (§10.4).
+message ReplayCallsRequest {
+  // The branch to replay onto. It MUST NOT be protected.
+  string target = 1;
+  // The target whose call log is read.
+  string source_target = 2;
+  // The calls, in the order to replay them.
+  repeated string call_ids = 3;
+  // Stop at the first call whose result digest differs.
+  bool stop_on_mismatch = 4;
+}
+
+// ReplayCallsResponse reports each replayed call.
+message ReplayCallsResponse {
+  // Request metadata.
+  ResponseMeta meta = 1;
+  // One entry per call replayed, in order.
+  repeated ReplayedCall calls = 2;
+}
+
+// ReplayedCall is one replayed call's outcome.
+message ReplayedCall {
+  // The call's id.
+  string call_id = 1;
+  // Whether the replay's result digest equals the logged one.
+  bool digest_matches = 2;
+  // Set when the replay failed.
+  ErrorDetail error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Live queries (§11)
+// ---------------------------------------------------------------------------
+
+// SubscribeRequest starts a live query.
+message SubscribeRequest {
+  // The target, budget and consistency.
+  RequestContext context = 1;
+  // The query.
+  oneof query {
+    // One read-only statement.
+    Statement statement = 2;
+    // A read-only named operation.
+    OperationInvocation call = 3;
+  }
+  // Resume after this cursor. Empty starts with a snapshot.
+  string cursor = 4;
+  // Minimum time between re-runs. Zero means 100 ms.
+  google.protobuf.Duration debounce = 5;
+}
+
+// SubscribeResponse is one event of a live query. Each event maps to a
+// CloudEvent (§11.3).
+message SubscribeResponse {
+  // The CloudEvents `id` of this event.
+  string event_id = 1;
+  // When the change was observed.
+  google.protobuf.Timestamp time = 2;
+  // The event.
+  oneof event {
+    // The full result: the first event, and again after a reset.
+    Snapshot snapshot = 3;
+    // The change since the previous event.
+    Diff diff = 4;
+    // No change; the cursor advanced.
+    Heartbeat heartbeat = 5;
+  }
+}
+
+// Snapshot is a full result.
+message Snapshot {
+  // The result.
+  ResultSet result = 1;
+  // The cursor after this snapshot.
+  string cursor = 2;
+  // True when this snapshot replaces a resume that could not be honoured.
+  bool reset = 3;
+}
+
+// Diff is a keyed change to the result.
+message Diff {
+  // Rows that entered the result.
+  repeated google.protobuf.ListValue added = 1;
+  // Rows that left the result.
+  repeated google.protobuf.ListValue removed = 2;
+  // Rows whose key stayed but whose other values changed (new values).
+  repeated google.protobuf.ListValue changed = 3;
+  // The cursor after this diff.
+  string cursor = 4;
+}
+
+// Heartbeat advances the cursor without a change.
+message Heartbeat {
+  // The cursor.
+  string cursor = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Errors (§6.2)
+// ---------------------------------------------------------------------------
+
+// ErrorDetail is attached to every error response, exactly once.
+message ErrorDetail {
+  // What the client should do.
+  ErrorCategory category = 1;
+  // A stable snake_case reason from §6.3, e.g. `serialization_failure`.
+  string reason = 2;
+  // The human-readable message. Not stable; do not parse.
+  string message = 3;
+  // The SQLSTATE, when the error came from the engine.
+  string sqlstate = 4;
+  // An engine-specific code (e.g. TiDB `9007`), when there is one.
+  string engine_code = 5;
+  // The failing statement's index in the batch, when there is one.
+  int32 statement_index = 6;
+  // A hint for retryable errors. Unset means the client's own backoff.
+  google.protobuf.Duration retry_after = 7;
+  // Extra machine-readable fields (constraint name, budget field, ...).
+  map<string, string> metadata = 8;
+}
+
+// ErrorCategory tells a client whether and how to retry (§6.2).
+enum ErrorCategory {
+  // Never sent.
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  // Retry the whole transaction or batch.
+  ERROR_CATEGORY_RETRYABLE_CONFLICT = 1;
+  // Retry later; nothing was applied.
+  ERROR_CATEGORY_RETRYABLE_UNAVAILABLE = 2;
+  // The commit's outcome is unknown; retry with the same idempotency key.
+  ERROR_CATEGORY_COMMIT_UNKNOWN = 3;
+  // A budget was hit; nothing was applied.
+  ERROR_CATEGORY_BUDGET_EXCEEDED = 4;
+  // Do not retry.
+  ERROR_CATEGORY_PERMANENT = 5;
+}

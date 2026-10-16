@@ -1,0 +1,12 @@
+# `buf lint` runs the STANDARD and COMMENTS rules over proto/. Loams mirrors
+# proto/loams/data/v1/ into its own proto/ tree unchanged.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+    - COMMENTS
+breaking:
+  use:
+    - FILE

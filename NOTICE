@@ -1,0 +1,9 @@
+Loams Data API
+Copyright 2026 The Loams Authors
+
+This product includes the Loams Data API specification, protocol
+definitions and conformance suite, developed by The Loams Authors and
+licensed under the Apache License, Version 2.0.
+
+The specification cites other projects as prior art (spec/data-api.md,
+Appendix A). No text or code from them is copied into this repository.
